@@ -8,7 +8,7 @@ Psiren is a comprehensive, high-performance audio processing application designe
   - **Live Mode:** For real-time microphone audio processing.
   - **Studio Mode:** For detailed, file-based audio repair and enhancement.
   - **Warmth Mode:** For applying analog-style saturation and drive.
-- **Advanced DSP Core:** Utilizes a 1D Perona-Malik Gradient Filter (PGF) for sophisticated, content-aware audio processing. The algorithm's principles are derived from MTS (Model-Based Theory) and MBT (Model-Based Transform) concepts.
+- **Advanced DSP Core:** Utilizes a 1D Perona-Malik Gradient Filter (PGF) for sophisticated, content-aware audio processing. The algorithm's principles are derived from MTS (Motion-Timrspace) physics engine.
 - **Interactive Waveform Editor:** A fully interactive editor in Studio Mode with zoom, pan, a synchronized playhead, and visual markers for detected audio clips.
 - **Real-time Recording:** Capture the output of the Live Filter directly to a `.wav` file.
 - **Full Undo/Redo System:** A robust, multi-level undo/redo history for all destructive operations in Studio Mode.
@@ -104,4 +104,5 @@ A creative tool for adding analog-style saturation and harmonic distortion.
 - **`Spacebar`**: Toggle Play/Pause in the active mode.
 - **`Ctrl+S`**: Save the currently loaded file (in Studio or Warmth mode).
 - **`Ctrl+Z`**: Undo the last action (in Studio mode).
+
 - **`Ctrl+Y`**: Redo the last undone action (in Studio mode).
