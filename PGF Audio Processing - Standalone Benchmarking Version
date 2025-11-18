@@ -1,0 +1,1238 @@
+"""
+PGF Audio Processing - Standalone Benchmarking Version
+=======================================================
+
+This file contains a pure Python implementation of the PGF (Perona-Malik Gradient Filter)
+audio processing algorithm for benchmarking purposes.
+
+The PGF algorithm applies anisotropic diffusion to audio signals, which can be used for:
+- Denoising audio while preserving transients and edges
+- Removing clicks and pops
+- Reducing clipping artifacts
+- Adding analog-style warmth and saturation
+
+Algorithm Overview:
+- Based on Perona-Malik anisotropic diffusion adapted for 1D audio signals
+- Uses iterative diffusion with edge-preserving gradient calculations
+- Implements ping-pong buffering for stable iterative processing
+
+Usage Example:
+    import numpy as np
+    import soundfile as sf
+   
+    # Load audio
+    audio, sr = sf.read('input.wav')
+   
+    # Process with PGF
+    processed = pgf_process_audio(audio, gamma=0.1, k_value=0.1, steps=5)
+   
+    # Save result
+    sf.write('output.wav', processed, sr)
+
+Parameters:
+- gamma: Filter strength (0.0 to 1.0) - higher values = more processing
+- k_value: Sensitivity threshold (0.01 to 1.0) - lower values preserve more edges
+- steps: Number of iterations (1 to 50) - more steps = smoother result
+
+Author: PGF Audio Suite
+Version: 1.0
+License: MIT
+"""
+
+import numpy as np
+from typing import Tuple, Optional
+import time
+
+
+class PGFAudioProcessor:
+    """
+    Pure Python implementation of the PGF audio processing algorithm.
+   
+    This class implements Perona-Malik anisotropic diffusion for 1D audio signals.
+    The algorithm iteratively smooths the audio while preserving sharp transients
+    and edges, making it effective for denoising and restoration tasks.
+    """
+   
+    def __init__(self, gamma: float = 0.1, k_value: float = 0.1, steps: int = 5):
+        """
+        Initialize the PGF audio processor.
+       
+        Args:
+            gamma: Filter strength (0.0 to 1.0). Higher values produce more smoothing.
+            k_value: Edge sensitivity (0.01 to 1.0). Lower values preserve more edges.
+            steps: Number of diffusion iterations (1 to 50). More steps = smoother.
+        """
+        self.gamma = gamma
+        self.k_value = k_value
+        self.steps = steps
+        self.dt = 0.2  # Time step for numerical stability
+       
+    def set_parameters(self, gamma: float, k_value: float, steps: int):
+        """
+        Update the processing parameters.
+       
+        Args:
+            gamma: Filter strength (0.0 to 1.0)
+            k_value: Edge sensitivity (0.01 to 1.0)
+            steps: Number of iterations (1 to 50)
+        """
+        self.gamma = gamma
+        self.k_value = k_value
+        self.steps = steps
+       
+    def _pgf_step(self, d_out: np.ndarray, d_in: np.ndarray, k_sq: float) -> None:
+        """
+        Perform a single PGF diffusion step.
+       
+        This implements one iteration of the Perona-Malik diffusion equation:
+        dU/dt = div(c(|âˆ‡U|) * âˆ‡U)
+       
+        where c(|âˆ‡U|) = gamma / (1 + (|âˆ‡U|/K)^2)
+       
+        Args:
+            d_out: Output buffer (will be modified in-place)
+            d_in: Input buffer (read-only)
+            k_sq: Squared sensitivity threshold (K^2)
+        """
+        n = len(d_in)
+       
+        for i in range(n):
+            # Get current sample and neighbors (with boundary clamping)
+            u_c = d_in[i]
+            u_l = d_in[i - 1] if i > 0 else u_c
+            u_r = d_in[i + 1] if i < n - 1 else u_c
+           
+            # Calculate gradients to left and right
+            grad_l = u_l - u_c
+            grad_r = u_r - u_c
+           
+            # Calculate diffusivity coefficients (edge-preserving)
+            # c = gamma / (1 + (grad/K)^2)
+            c_l = self.gamma / (1.0 + (grad_l * grad_l) / k_sq)
+            c_r = self.gamma / (1.0 + (grad_r * grad_r) / k_sq)
+           
+            # Calculate total flux (divergence of the diffusion)
+            flux = c_l * grad_l + c_r * grad_r
+           
+            # Update sample using Euler's method
+            d_out[i] = u_c + self.dt * flux
+   
+    def process(self, buffer: np.ndarray) -> np.ndarray:
+        """
+        Process an audio buffer with PGF algorithm.
+       
+        Args:
+            buffer: Input audio as numpy array (will not be modified)
+           
+        Returns:
+            Processed audio as numpy array (same shape as input)
+        """
+        # Ensure buffer is float32 for consistency
+        if buffer.dtype != np.float32:
+            buffer = buffer.astype(np.float32)
+       
+        # Handle multi-channel audio
+        if buffer.ndim > 1:
+            # Process each channel independently
+            processed = np.zeros_like(buffer, dtype=np.float32)
+            for channel in range(buffer.shape[1]):
+                processed[:, channel] = self._process_mono(buffer[:, channel])
+            return processed
+        else:
+            # Mono audio
+            return self._process_mono(buffer)
+   
+    def _process_mono(self, buffer: np.ndarray) -> np.ndarray:
+        """
+        Process a mono audio buffer.
+       
+        Args:
+            buffer: 1D numpy array of audio samples
+           
+        Returns:
+            Processed 1D numpy array
+        """
+        num_samples = len(buffer)
+       
+        # Pre-calculate derived parameters
+        k_sq = self.k_value * self.k_value
+        if k_sq == 0.0:
+            k_sq = 1e-6  # Avoid divide-by-zero
+       
+        # Create ping-pong buffers for iterative processing
+        buffer_a = np.copy(buffer).astype(np.float32)
+        buffer_b = np.zeros(num_samples, dtype=np.float32)
+       
+        # Pointers for ping-pong buffering
+        d_in = buffer_a
+        d_out = buffer_b
+       
+        # Run the iterative diffusion
+        for i in range(self.steps):
+            self._pgf_step(d_out, d_in, k_sq)
+            # Swap buffers for next iteration
+            d_in, d_out = d_out, d_in
+       
+        # After the loop, d_in holds the final result (due to swap)
+        return d_in
+   
+    def process_inplace(self, buffer: np.ndarray) -> None:
+        """
+        Process an audio buffer in-place (modifies the input array).
+       
+        Args:
+            buffer: Input/output audio as numpy array (will be modified)
+        """
+        processed = self.process(buffer)
+        buffer[:] = processed
+
+
+# Convenience function for simple one-shot processing
+def pgf_process_audio(
+    audio: np.ndarray,
+    gamma: float = 0.1,
+    k_value: float = 0.1,
+    steps: int = 5
+) -> np.ndarray:
+    """
+    Process audio with PGF algorithm (convenience function).
+   
+    Args:
+        audio: Input audio as numpy array
+        gamma: Filter strength (0.0 to 1.0)
+        k_value: Edge sensitivity (0.01 to 1.0)
+        steps: Number of iterations (1 to 50)
+       
+    Returns:
+        Processed audio as numpy array
+    """
+    processor = PGFAudioProcessor(gamma, k_value, steps)
+    return processor.process(audio)
+
+
+# Processing mode presets (from PGF Audio Suite)
+
+def pgf_denoise(
+    audio: np.ndarray,
+    strength: float = 0.3,
+    sensitivity: float = 0.1,
+    quality: int = 5
+) -> np.ndarray:
+    """
+    Denoise audio while preserving transients.
+   
+    Args:
+        audio: Input audio array
+        strength: Noise reduction strength (0.0 to 1.0)
+        sensitivity: Edge preservation (0.0 to 1.0) - lower preserves more detail
+        quality: Processing quality in steps (1 to 50)
+       
+    Returns:
+        Denoised audio array
+    """
+    return pgf_process_audio(audio, gamma=strength, k_value=sensitivity, steps=quality)
+
+
+def pgf_declip(
+    audio: np.ndarray,
+    strength: float = 0.8,
+    sensitivity: float = 0.01,
+    quality: int = 20
+) -> np.ndarray:
+    """
+    Repair clipped/distorted audio.
+   
+    Uses aggressive settings optimized for declipping:
+    - High gamma (strength) for strong smoothing
+    - Very low K (sensitivity) to preserve dynamics
+    - High iteration count for quality
+   
+    Args:
+        audio: Input audio array with clipping
+        strength: Repair strength (0.0 to 1.0) - default 0.8
+        sensitivity: Edge sensitivity (0.01 to 1.0) - default 0.01
+        quality: Processing quality in steps (1 to 50) - default 20
+       
+    Returns:
+        Repaired audio array
+    """
+    return pgf_process_audio(audio, gamma=strength, k_value=sensitivity, steps=quality)
+
+
+def pgf_declick(
+    audio: np.ndarray,
+    sensitivity: float = 0.5
+) -> np.ndarray:
+    """
+    Remove clicks and pops from audio.
+   
+    Args:
+        audio: Input audio array with clicks
+        sensitivity: Click detection sensitivity (0.0 to 1.0)
+                    Higher = only catches bigger clicks
+       
+    Returns:
+        Declicked audio array
+    """
+    # Medium strength, adaptive K based on sensitivity, fast processing
+    gamma = 0.5
+    k_value = sensitivity
+    steps = 3
+    return pgf_process_audio(audio, gamma=gamma, k_value=k_value, steps=steps)
+
+
+def pgf_clarity(
+    audio: np.ndarray,
+    amount: float = 0.5
+) -> np.ndarray:
+    """
+    Enhance clarity and presence of audio.
+   
+    Uses gentle denoising with high transient preservation.
+   
+    Args:
+        audio: Input audio array
+        amount: Clarity enhancement amount (0.0 to 1.0)
+       
+    Returns:
+        Enhanced audio array
+    """
+    # Gentle strength, very low K for transient preservation
+    gamma = 0.1 + (amount * 0.1)  # 0.1 to 0.2
+    k_value = 0.1 - (amount * 0.09)  # 0.1 to 0.01
+    steps = 3
+    return pgf_process_audio(audio, gamma=gamma, k_value=k_value, steps=steps)
+
+
+def pgf_warmth(
+    audio: np.ndarray,
+    drive: float = 0.5,
+    quality: int = 8
+) -> np.ndarray:
+    """
+    Add analog-style warmth and saturation to audio.
+   
+    This mode works by:
+    1. Applying pre-gain (input gain) to push the signal
+    2. Using PGF algorithm to smooth the resulting clipping (soft-clip effect)
+    3. Creating analog-style saturation and warmth
+   
+    Args:
+        audio: Input audio array
+        drive: Saturation drive amount (0.0 to 1.0)
+        quality: Processing quality in steps (1 to 50) - default 8
+       
+    Returns:
+        Processed audio with warmth/saturation
+    """
+    # Calculate parameters based on drive (matching VST plugin algorithm)
+    input_gain = 1.0 + (drive * 20.0)  # Add up to 20x gain
+    gamma = 0.1 + (drive * 0.5)  # 0.1 to 0.6 (smoothing strength)
+    k_value = 0.5 - (drive * 0.4)  # 0.5 to 0.1 (edge sensitivity)
+    steps = 2 + int(drive * quality / 0.5)  # Adaptive steps based on drive
+   
+    # Apply pre-gain (this creates the "heat" that gets smoothed)
+    audio_driven = audio * input_gain
+   
+    # Apply PGF processing (soft-clipping via anisotropic diffusion)
+    return pgf_process_audio(audio_driven, gamma=gamma, k_value=k_value, steps=steps)
+
+
+# Additional utility functions for audio processing
+
+def detect_clipping(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
+    """
+    Detect clipped samples in audio.
+   
+    Args:
+        audio: Input audio array
+        threshold: Level to consider as clipped (default 0.98)
+       
+    Returns:
+        Array of indices where clipping occurs
+    """
+    return np.where(np.abs(audio) >= threshold)[0]
+
+
+def normalize_audio(audio: np.ndarray, target_level: float = 0.95) -> np.ndarray:
+    """
+    Normalize audio to a target peak level.
+   
+    Args:
+        audio: Input audio array
+        target_level: Target peak level (0.0 to 1.0)
+       
+    Returns:
+        Normalized audio array
+    """
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        return audio * (target_level / peak)
+    return audio
+
+
+def calculate_rms(audio: np.ndarray) -> float:
+    """
+    Calculate RMS (Root Mean Square) level of audio.
+   
+    Args:
+        audio: Input audio array
+       
+    Returns:
+        RMS level as float
+    """
+    return np.sqrt(np.mean(audio ** 2))
+
+
+def generate_test_audio(duration: float = 1.0, sample_rate: int = 44100) -> Tuple[np.ndarray, int]:
+    """
+    Generate test audio signal with noise and transients.
+   
+    Args:
+        duration: Length in seconds
+        sample_rate: Sample rate in Hz
+       
+    Returns:
+        Tuple of (audio array, sample_rate)
+    """
+    num_samples = int(duration * sample_rate)
+    t = np.linspace(0, duration, num_samples)
+   
+    # Generate a mix of signals
+    signal = (
+        0.3 * np.sin(2 * np.pi * 440 * t) +  # 440 Hz tone
+        0.2 * np.sin(2 * np.pi * 880 * t) +  # Harmonic
+        0.1 * np.random.randn(num_samples)   # Noise
+    )
+   
+    # Add some transients (clicks)
+    for i in range(5):
+        click_pos = np.random.randint(0, num_samples)
+        if click_pos < num_samples:
+            signal[click_pos] += 0.5
+   
+    return signal.astype(np.float32), sample_rate
+
+
+# Benchmarking functions (matching compression benchmark structure)
+
+def benchmark_pgf_method(
+    audio: np.ndarray,
+    method_name: str,
+    method_func,
+    iterations: int = 10,
+    **method_kwargs
+) -> dict:
+    """
+    Benchmark a single PGF processing method.
+   
+    Args:
+        audio: Input audio array
+        method_name: Name of the method being tested
+        method_func: Function to call (e.g., pgf_denoise, pgf_warmth)
+        iterations: Number of benchmark iterations
+        **method_kwargs: Parameters to pass to the method
+       
+    Returns:
+        Dictionary with benchmark results matching compression benchmark format
+    """
+    times = []
+    processed_result = None
+   
+    for i in range(iterations):
+        start = time.perf_counter()
+        processed_result = method_func(audio, **method_kwargs)
+        end = time.perf_counter()
+        times.append(end - start)
+   
+    times = np.array(times)
+    sample_rate = 44100  # Assume CD quality
+   
+    return {
+        'method': method_name,
+        'processing_time': np.mean(times),
+        'min_time': np.min(times),
+        'max_time': np.max(times),
+        'std_time': np.std(times),
+        'samples_per_second': len(audio) / np.mean(times),
+        'audio_duration_sec': len(audio) / sample_rate,
+        'realtime_factor': (len(audio) / sample_rate) / np.mean(times),
+        'input_rms': calculate_rms(audio),
+        'output_rms': calculate_rms(processed_result) if processed_result is not None else 0.0,
+        'rms_change_db': 20 * np.log10(calculate_rms(processed_result) / (calculate_rms(audio) + 1e-10)) if processed_result is not None else 0.0
+    }
+
+
+def benchmark_all_pgf_methods(
+    audio: np.ndarray,
+    iterations: int = 10
+) -> dict:
+    """
+    Benchmark all PGF processing methods (like compression benchmark tests all compressors).
+   
+    Args:
+        audio: Input audio array
+        iterations: Number of benchmark iterations per method
+       
+    Returns:
+        Dictionary mapping method names to benchmark results
+    """
+    results = {}
+   
+    print("\n[Benchmarking] Testing PGF Audio Processing Methods...")
+   
+    # Test each processing mode
+    methods = [
+        ('pgf_denoise_light', pgf_denoise, {'strength': 0.2, 'sensitivity': 0.15, 'quality': 3}),
+        ('pgf_denoise_medium', pgf_denoise, {'strength': 0.3, 'sensitivity': 0.1, 'quality': 5}),
+        ('pgf_denoise_heavy', pgf_denoise, {'strength': 0.5, 'sensitivity': 0.05, 'quality': 10}),
+        ('pgf_declip', pgf_declip, {}),
+        ('pgf_declick', pgf_declick, {'sensitivity': 0.5}),
+        ('pgf_clarity_low', pgf_clarity, {'amount': 0.3}),
+        ('pgf_clarity_high', pgf_clarity, {'amount': 0.7}),
+        ('pgf_warmth_low', pgf_warmth, {'drive': 0.3, 'quality': 5}),
+        ('pgf_warmth_medium', pgf_warmth, {'drive': 0.5, 'quality': 8}),
+        ('pgf_warmth_high', pgf_warmth, {'drive': 0.8, 'quality': 12}),
+    ]
+   
+    for method_name, method_func, kwargs in methods:
+        print(f"  Benchmarking {method_name}...")
+        results[method_name] = benchmark_pgf_method(
+            audio, method_name, method_func, iterations, **kwargs
+        )
+   
+    return results
+
+
+def print_benchmark_results(results: dict, audio_duration: float):
+    """
+    Print benchmark results in a table format (matching compression benchmark style).
+   
+    Args:
+        results: Dictionary of benchmark results
+        audio_duration: Duration of test audio in seconds
+    """
+    print("\n" + "=" * 100)
+    print("PGF AUDIO PROCESSING BENCHMARK RESULTS")
+    print("=" * 100)
+    print(f"Test Audio Duration: {audio_duration:.2f} seconds")
+    print(f"Sample Rate: 44100 Hz")
+    print("\n")
+   
+    # Header
+    print(f"{'Method':<25} {'Time (ms)':<12} {'RT Factor':<12} {'RMS Change (dB)':<15} {'Samples/sec':<15}")
+    print("-" * 100)
+   
+    # Sort by processing time
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['processing_time'])
+   
+    for method_name, result in sorted_results:
+        print(f"{method_name:<25} "
+              f"{result['processing_time']*1000:>10.2f}  "
+              f"{result['realtime_factor']:>10.2f}x  "
+              f"{result['rms_change_db']:>13.2f}  "
+              f"{result['samples_per_second']:>13.0f}")
+   
+    print("\n" + "=" * 100)
+    print("RT Factor: Higher is better (>1.0x = faster than real-time)")
+    print("RMS Change: Negative = reduction, Positive = amplification")
+    print("=" * 100)
+
+
+# Example usage and demonstration
+if __name__ == "__main__":
+    print("=" * 70)
+    print("PGF Audio Processing - Standalone Benchmarking Version")
+    print("=" * 70)
+   
+    # Generate test audio
+    print("\n[1] Generating test audio...")
+    test_audio, sr = generate_test_audio(duration=5.0, sample_rate=44100)
+    print(f"    Generated {len(test_audio)} samples at {sr} Hz ({len(test_audio)/sr:.2f} seconds)")
+    print(f"    RMS level: {calculate_rms(test_audio):.4f}")
+   
+    # Single processing test
+    print("\n[2] Testing single PGF processing...")
+    processor = PGFAudioProcessor(gamma=0.1, k_value=0.1, steps=5)
+   
+    start = time.perf_counter()
+    processed = processor.process(test_audio)
+    end = time.perf_counter()
+   
+    print(f"    Processing time: {(end - start) * 1000:.2f} ms")
+    print(f"    Realtime factor: {(len(test_audio)/sr) / (end - start):.2f}x")
+    print(f"    Input RMS: {calculate_rms(test_audio):.4f}")
+    print(f"    Output RMS: {calculate_rms(processed):.4f}")
+   
+    # Comprehensive benchmark (like compression benchmark)
+    print("\n[3] Running comprehensive benchmark (all methods)...")
+    results = benchmark_all_pgf_methods(test_audio, iterations=10)
+    print_benchmark_results(results, len(test_audio) / sr)
+   
+    print("\n[4] Quality metrics comparison...")
+    # Process with different strengths
+    light = pgf_process_audio(test_audio, gamma=0.05, k_value=0.1, steps=3)
+    medium = pgf_process_audio(test_audio, gamma=0.1, k_value=0.1, steps=5)
+    heavy = pgf_process_audio(test_audio, gamma=0.2, k_value=0.1, steps=10)
+   
+    print(f"    Original:  RMS={calculate_rms(test_audio):.4f}, Peak={np.max(np.abs(test_audio)):.4f}")
+    print(f"    Light:     RMS={calculate_rms(light):.4f}, Peak={np.max(np.abs(light)):.4f}")
+    print(f"    Medium:    RMS={calculate_rms(medium):.4f}, Peak={np.max(np.abs(medium)):.4f}")
+    print(f"    Heavy:     RMS={calculate_rms(heavy):.4f}, Peak={np.max(np.abs(heavy)):.4f}")
+   
+    print("\n[5] Testing PGF Audio Suite processing modes...")
+    # Test all the preset modes
+    denoised = pgf_denoise(test_audio, strength=0.3, sensitivity=0.1, quality=5)
+    declicked = pgf_declick(test_audio, sensitivity=0.5)
+    clarity_enhanced = pgf_clarity(test_audio, amount=0.5)
+    warm = pgf_warmth(test_audio, drive=0.5, quality=8)
+   
+    print(f"    Denoise:   RMS={calculate_rms(denoised):.4f}, Peak={np.max(np.abs(denoised)):.4f}")
+    print(f"    Declick:   RMS={calculate_rms(declicked):.4f}, Peak={np.max(np.abs(declicked)):.4f}")
+    print(f"    Clarity:   RMS={calculate_rms(clarity_enhanced):.4f}, Peak={np.max(np.abs(clarity_enhanced)):.4f}")
+    print(f"    Warmth:    RMS={calculate_rms(warm):.4f}, Peak={np.max(np.abs(warm)):.4f}")
+   
+    print("\n" + "=" * 70)
+    print("Benchmark complete!")
+    print("=" * 70)
+   
+    # Optional: Save results if soundfile is available
+    try:
+        import soundfile as sf
+        print("\n[6] Saving audio examples...")
+        sf.write('pgf_test_original.wav', test_audio, sr)
+        sf.write('pgf_test_light.wav', light, sr)
+        sf.write('pgf_test_medium.wav', medium, sr)
+        sf.write('pgf_test_heavy.wav', heavy, sr)
+        sf.write('pgf_test_denoise.wav', denoised, sr)
+        sf.write('pgf_test_declick.wav', declicked, sr)
+        sf.write('pgf_test_clarity.wav', clarity_enhanced, sr)
+        sf.write('pgf_test_warmth.wav', warm, sr)
+        print("    Saved: pgf_test_*.wav files (8 variations)")
+    except ImportError:
+        print("\n[6] Install soundfile package to save audio examples")
+        print("    pip install soundfile")
+   
+    print()  
+
+
+
+
+
+
+"""
+PGF Audio Processing - Standalone Benchmarking Version
+=======================================================
+
+This file contains a pure Python implementation of the PGF (Perona-Malik Gradient Filter)
+audio processing algorithm for benchmarking purposes.
+
+The PGF algorithm applies anisotropic diffusion to audio signals, which can be used for:
+- Denoising audio while preserving transients and edges
+- Removing clicks and pops
+- Reducing clipping artifacts
+- Adding analog-style warmth and saturation
+
+Algorithm Overview:
+- Based on Perona-Malik anisotropic diffusion adapted for 1D audio signals
+- Uses iterative diffusion with edge-preserving gradient calculations
+- Implements ping-pong buffering for stable iterative processing
+
+Usage Example:
+    import numpy as np
+    import soundfile as sf
+   
+    # Load audio
+    audio, sr = sf.read('input.wav')
+   
+    # Process with PGF
+    processed = pgf_process_audio(audio, gamma=0.1, k_value=0.1, steps=5)
+   
+    # Save result
+    sf.write('output.wav', processed, sr)
+
+Parameters:
+- gamma: Filter strength (0.0 to 1.0) - higher values = more processing
+- k_value: Sensitivity threshold (0.01 to 1.0) - lower values preserve more edges
+- steps: Number of iterations (1 to 50) - more steps = smoother result
+
+Author: PGF Audio Suite
+Version: 1.0
+License: MIT
+"""
+
+import numpy as np
+from typing import Tuple, Optional
+import time
+
+
+class PGFAudioProcessor:
+    """
+    Pure Python implementation of the PGF audio processing algorithm.
+   
+    This class implements Perona-Malik anisotropic diffusion for 1D audio signals.
+    The algorithm iteratively smooths the audio while preserving sharp transients
+    and edges, making it effective for denoising and restoration tasks.
+    """
+   
+    def __init__(self, gamma: float = 0.1, k_value: float = 0.1, steps: int = 5):
+        """
+        Initialize the PGF audio processor.
+       
+        Args:
+            gamma: Filter strength (0.0 to 1.0). Higher values produce more smoothing.
+            k_value: Edge sensitivity (0.01 to 1.0). Lower values preserve more edges.
+            steps: Number of diffusion iterations (1 to 50). More steps = smoother.
+        """
+        self.gamma = gamma
+        self.k_value = k_value
+        self.steps = steps
+        self.dt = 0.2  # Time step for numerical stability
+       
+    def set_parameters(self, gamma: float, k_value: float, steps: int):
+        """
+        Update the processing parameters.
+       
+        Args:
+            gamma: Filter strength (0.0 to 1.0)
+            k_value: Edge sensitivity (0.01 to 1.0)
+            steps: Number of iterations (1 to 50)
+        """
+        self.gamma = gamma
+        self.k_value = k_value
+        self.steps = steps
+       
+    def _pgf_step(self, d_out: np.ndarray, d_in: np.ndarray, k_sq: float) -> None:
+        """
+        Perform a single PGF diffusion step.
+       
+        This implements one iteration of the Perona-Malik diffusion equation:
+        dU/dt = div(c(|âˆ‡U|) * âˆ‡U)
+       
+        where c(|âˆ‡U|) = gamma / (1 + (|âˆ‡U|/K)^2)
+       
+        Args:
+            d_out: Output buffer (will be modified in-place)
+            d_in: Input buffer (read-only)
+            k_sq: Squared sensitivity threshold (K^2)
+        """
+        n = len(d_in)
+       
+        for i in range(n):
+            # Get current sample and neighbors (with boundary clamping)
+            u_c = d_in[i]
+            u_l = d_in[i - 1] if i > 0 else u_c
+            u_r = d_in[i + 1] if i < n - 1 else u_c
+           
+            # Calculate gradients to left and right
+            grad_l = u_l - u_c
+            grad_r = u_r - u_c
+           
+            # Calculate diffusivity coefficients (edge-preserving)
+            # c = gamma / (1 + (grad/K)^2)
+            c_l = self.gamma / (1.0 + (grad_l * grad_l) / k_sq)
+            c_r = self.gamma / (1.0 + (grad_r * grad_r) / k_sq)
+           
+            # Calculate total flux (divergence of the diffusion)
+            flux = c_l * grad_l + c_r * grad_r
+           
+            # Update sample using Euler's method
+            d_out[i] = u_c + self.dt * flux
+   
+    def process(self, buffer: np.ndarray) -> np.ndarray:
+        """
+        Process an audio buffer with PGF algorithm.
+       
+        Args:
+            buffer: Input audio as numpy array (will not be modified)
+           
+        Returns:
+            Processed audio as numpy array (same shape as input)
+        """
+        # Ensure buffer is float32 for consistency
+        if buffer.dtype != np.float32:
+            buffer = buffer.astype(np.float32)
+       
+        # Handle multi-channel audio
+        if buffer.ndim > 1:
+            # Process each channel independently
+            processed = np.zeros_like(buffer, dtype=np.float32)
+            for channel in range(buffer.shape[1]):
+                processed[:, channel] = self._process_mono(buffer[:, channel])
+            return processed
+        else:
+            # Mono audio
+            return self._process_mono(buffer)
+   
+    def _process_mono(self, buffer: np.ndarray) -> np.ndarray:
+        """
+        Process a mono audio buffer.
+       
+        Args:
+            buffer: 1D numpy array of audio samples
+           
+        Returns:
+            Processed 1D numpy array
+        """
+        num_samples = len(buffer)
+       
+        # Pre-calculate derived parameters
+        k_sq = self.k_value * self.k_value
+        if k_sq == 0.0:
+            k_sq = 1e-6  # Avoid divide-by-zero
+       
+        # Create ping-pong buffers for iterative processing
+        buffer_a = np.copy(buffer).astype(np.float32)
+        buffer_b = np.zeros(num_samples, dtype=np.float32)
+       
+        # Pointers for ping-pong buffering
+        d_in = buffer_a
+        d_out = buffer_b
+       
+        # Run the iterative diffusion
+        for i in range(self.steps):
+            self._pgf_step(d_out, d_in, k_sq)
+            # Swap buffers for next iteration
+            d_in, d_out = d_out, d_in
+       
+        # After the loop, d_in holds the final result (due to swap)
+        return d_in
+   
+    def process_inplace(self, buffer: np.ndarray) -> None:
+        """
+        Process an audio buffer in-place (modifies the input array).
+       
+        Args:
+            buffer: Input/output audio as numpy array (will be modified)
+        """
+        processed = self.process(buffer)
+        buffer[:] = processed
+
+
+# Convenience function for simple one-shot processing
+def pgf_process_audio(
+    audio: np.ndarray,
+    gamma: float = 0.1,
+    k_value: float = 0.1,
+    steps: int = 5
+) -> np.ndarray:
+    """
+    Process audio with PGF algorithm (convenience function).
+   
+    Args:
+        audio: Input audio as numpy array
+        gamma: Filter strength (0.0 to 1.0)
+        k_value: Edge sensitivity (0.01 to 1.0)
+        steps: Number of iterations (1 to 50)
+       
+    Returns:
+        Processed audio as numpy array
+    """
+    processor = PGFAudioProcessor(gamma, k_value, steps)
+    return processor.process(audio)
+
+
+# Processing mode presets (from PGF Audio Suite)
+
+def pgf_denoise(
+    audio: np.ndarray,
+    strength: float = 0.3,
+    sensitivity: float = 0.1,
+    quality: int = 5
+) -> np.ndarray:
+    """
+    Denoise audio while preserving transients.
+   
+    Args:
+        audio: Input audio array
+        strength: Noise reduction strength (0.0 to 1.0)
+        sensitivity: Edge preservation (0.0 to 1.0) - lower preserves more detail
+        quality: Processing quality in steps (1 to 50)
+       
+    Returns:
+        Denoised audio array
+    """
+    return pgf_process_audio(audio, gamma=strength, k_value=sensitivity, steps=quality)
+
+
+def pgf_declip(
+    audio: np.ndarray,
+    strength: float = 0.8,
+    sensitivity: float = 0.01,
+    quality: int = 20
+) -> np.ndarray:
+    """
+    Repair clipped/distorted audio.
+   
+    Uses aggressive settings optimized for declipping:
+    - High gamma (strength) for strong smoothing
+    - Very low K (sensitivity) to preserve dynamics
+    - High iteration count for quality
+   
+    Args:
+        audio: Input audio array with clipping
+        strength: Repair strength (0.0 to 1.0) - default 0.8
+        sensitivity: Edge sensitivity (0.01 to 1.0) - default 0.01
+        quality: Processing quality in steps (1 to 50) - default 20
+       
+    Returns:
+        Repaired audio array
+    """
+    return pgf_process_audio(audio, gamma=strength, k_value=sensitivity, steps=quality)
+
+
+def pgf_declick(
+    audio: np.ndarray,
+    sensitivity: float = 0.5
+) -> np.ndarray:
+    """
+    Remove clicks and pops from audio.
+   
+    Args:
+        audio: Input audio array with clicks
+        sensitivity: Click detection sensitivity (0.0 to 1.0)
+                    Higher = only catches bigger clicks
+       
+    Returns:
+        Declicked audio array
+    """
+    # Medium strength, adaptive K based on sensitivity, fast processing
+    gamma = 0.5
+    k_value = sensitivity
+    steps = 3
+    return pgf_process_audio(audio, gamma=gamma, k_value=k_value, steps=steps)
+
+
+def pgf_clarity(
+    audio: np.ndarray,
+    amount: float = 0.5
+) -> np.ndarray:
+    """
+    Enhance clarity and presence of audio.
+   
+    Uses gentle denoising with high transient preservation.
+   
+    Args:
+        audio: Input audio array
+        amount: Clarity enhancement amount (0.0 to 1.0)
+       
+    Returns:
+        Enhanced audio array
+    """
+    # Gentle strength, very low K for transient preservation
+    gamma = 0.1 + (amount * 0.1)  # 0.1 to 0.2
+    k_value = 0.1 - (amount * 0.09)  # 0.1 to 0.01
+    steps = 3
+    return pgf_process_audio(audio, gamma=gamma, k_value=k_value, steps=steps)
+
+
+def pgf_warmth(
+    audio: np.ndarray,
+    drive: float = 0.5,
+    quality: int = 8
+) -> np.ndarray:
+    """
+    Add analog-style warmth and saturation to audio.
+   
+    This mode works by:
+    1. Applying pre-gain (input gain) to push the signal
+    2. Using PGF algorithm to smooth the resulting clipping (soft-clip effect)
+    3. Creating analog-style saturation and warmth
+   
+    Args:
+        audio: Input audio array
+        drive: Saturation drive amount (0.0 to 1.0)
+        quality: Processing quality in steps (1 to 50) - default 8
+       
+    Returns:
+        Processed audio with warmth/saturation
+    """
+    # Calculate parameters based on drive (matching VST plugin algorithm)
+    input_gain = 1.0 + (drive * 20.0)  # Add up to 20x gain
+    gamma = 0.1 + (drive * 0.5)  # 0.1 to 0.6 (smoothing strength)
+    k_value = 0.5 - (drive * 0.4)  # 0.5 to 0.1 (edge sensitivity)
+    steps = 2 + int(drive * quality / 0.5)  # Adaptive steps based on drive
+   
+    # Apply pre-gain (this creates the "heat" that gets smoothed)
+    audio_driven = audio * input_gain
+   
+    # Apply PGF processing (soft-clipping via anisotropic diffusion)
+    return pgf_process_audio(audio_driven, gamma=gamma, k_value=k_value, steps=steps)
+
+
+# Additional utility functions for audio processing
+
+def detect_clipping(audio: np.ndarray, threshold: float = 0.98) -> np.ndarray:
+    """
+    Detect clipped samples in audio.
+   
+    Args:
+        audio: Input audio array
+        threshold: Level to consider as clipped (default 0.98)
+       
+    Returns:
+        Array of indices where clipping occurs
+    """
+    return np.where(np.abs(audio) >= threshold)[0]
+
+
+def normalize_audio(audio: np.ndarray, target_level: float = 0.95) -> np.ndarray:
+    """
+    Normalize audio to a target peak level.
+   
+    Args:
+        audio: Input audio array
+        target_level: Target peak level (0.0 to 1.0)
+       
+    Returns:
+        Normalized audio array
+    """
+    peak = np.max(np.abs(audio))
+    if peak > 0:
+        return audio * (target_level / peak)
+    return audio
+
+
+def calculate_rms(audio: np.ndarray) -> float:
+    """
+    Calculate RMS (Root Mean Square) level of audio.
+   
+    Args:
+        audio: Input audio array
+       
+    Returns:
+        RMS level as float
+    """
+    return np.sqrt(np.mean(audio ** 2))
+
+
+def generate_test_audio(duration: float = 1.0, sample_rate: int = 44100) -> Tuple[np.ndarray, int]:
+    """
+    Generate test audio signal with noise and transients.
+   
+    Args:
+        duration: Length in seconds
+        sample_rate: Sample rate in Hz
+       
+    Returns:
+        Tuple of (audio array, sample_rate)
+    """
+    num_samples = int(duration * sample_rate)
+    t = np.linspace(0, duration, num_samples)
+   
+    # Generate a mix of signals
+    signal = (
+        0.3 * np.sin(2 * np.pi * 440 * t) +  # 440 Hz tone
+        0.2 * np.sin(2 * np.pi * 880 * t) +  # Harmonic
+        0.1 * np.random.randn(num_samples)   # Noise
+    )
+   
+    # Add some transients (clicks)
+    for i in range(5):
+        click_pos = np.random.randint(0, num_samples)
+        if click_pos < num_samples:
+            signal[click_pos] += 0.5
+   
+    return signal.astype(np.float32), sample_rate
+
+
+# Benchmarking functions (matching compression benchmark structure)
+
+def benchmark_pgf_method(
+    audio: np.ndarray,
+    method_name: str,
+    method_func,
+    iterations: int = 10,
+    **method_kwargs
+) -> dict:
+    """
+    Benchmark a single PGF processing method.
+   
+    Args:
+        audio: Input audio array
+        method_name: Name of the method being tested
+        method_func: Function to call (e.g., pgf_denoise, pgf_warmth)
+        iterations: Number of benchmark iterations
+        **method_kwargs: Parameters to pass to the method
+       
+    Returns:
+        Dictionary with benchmark results matching compression benchmark format
+    """
+    times = []
+    processed_result = None
+   
+    for i in range(iterations):
+        start = time.perf_counter()
+        processed_result = method_func(audio, **method_kwargs)
+        end = time.perf_counter()
+        times.append(end - start)
+   
+    times = np.array(times)
+    sample_rate = 44100  # Assume CD quality
+   
+    return {
+        'method': method_name,
+        'processing_time': np.mean(times),
+        'min_time': np.min(times),
+        'max_time': np.max(times),
+        'std_time': np.std(times),
+        'samples_per_second': len(audio) / np.mean(times),
+        'audio_duration_sec': len(audio) / sample_rate,
+        'realtime_factor': (len(audio) / sample_rate) / np.mean(times),
+        'input_rms': calculate_rms(audio),
+        'output_rms': calculate_rms(processed_result) if processed_result is not None else 0.0,
+        'rms_change_db': 20 * np.log10(calculate_rms(processed_result) / (calculate_rms(audio) + 1e-10)) if processed_result is not None else 0.0
+    }
+
+
+def benchmark_all_pgf_methods(
+    audio: np.ndarray,
+    iterations: int = 10
+) -> dict:
+    """
+    Benchmark all PGF processing methods (like compression benchmark tests all compressors).
+   
+    Args:
+        audio: Input audio array
+        iterations: Number of benchmark iterations per method
+       
+    Returns:
+        Dictionary mapping method names to benchmark results
+    """
+    results = {}
+   
+    print("\n[Benchmarking] Testing PGF Audio Processing Methods...")
+   
+    # Test each processing mode
+    methods = [
+        ('pgf_denoise_light', pgf_denoise, {'strength': 0.2, 'sensitivity': 0.15, 'quality': 3}),
+        ('pgf_denoise_medium', pgf_denoise, {'strength': 0.3, 'sensitivity': 0.1, 'quality': 5}),
+        ('pgf_denoise_heavy', pgf_denoise, {'strength': 0.5, 'sensitivity': 0.05, 'quality': 10}),
+        ('pgf_declip', pgf_declip, {}),
+        ('pgf_declick', pgf_declick, {'sensitivity': 0.5}),
+        ('pgf_clarity_low', pgf_clarity, {'amount': 0.3}),
+        ('pgf_clarity_high', pgf_clarity, {'amount': 0.7}),
+        ('pgf_warmth_low', pgf_warmth, {'drive': 0.3, 'quality': 5}),
+        ('pgf_warmth_medium', pgf_warmth, {'drive': 0.5, 'quality': 8}),
+        ('pgf_warmth_high', pgf_warmth, {'drive': 0.8, 'quality': 12}),
+    ]
+   
+    for method_name, method_func, kwargs in methods:
+        print(f"  Benchmarking {method_name}...")
+        results[method_name] = benchmark_pgf_method(
+            audio, method_name, method_func, iterations, **kwargs
+        )
+   
+    return results
+
+
+def print_benchmark_results(results: dict, audio_duration: float):
+    """
+    Print benchmark results in a table format (matching compression benchmark style).
+   
+    Args:
+        results: Dictionary of benchmark results
+        audio_duration: Duration of test audio in seconds
+    """
+    print("\n" + "=" * 100)
+    print("PGF AUDIO PROCESSING BENCHMARK RESULTS")
+    print("=" * 100)
+    print(f"Test Audio Duration: {audio_duration:.2f} seconds")
+    print(f"Sample Rate: 44100 Hz")
+    print("\n")
+   
+    # Header
+    print(f"{'Method':<25} {'Time (ms)':<12} {'RT Factor':<12} {'RMS Change (dB)':<15} {'Samples/sec':<15}")
+    print("-" * 100)
+   
+    # Sort by processing time
+    sorted_results = sorted(results.items(), key=lambda x: x[1]['processing_time'])
+   
+    for method_name, result in sorted_results:
+        print(f"{method_name:<25} "
+              f"{result['processing_time']*1000:>10.2f}  "
+              f"{result['realtime_factor']:>10.2f}x  "
+              f"{result['rms_change_db']:>13.2f}  "
+              f"{result['samples_per_second']:>13.0f}")
+   
+    print("\n" + "=" * 100)
+    print("RT Factor: Higher is better (>1.0x = faster than real-time)")
+    print("RMS Change: Negative = reduction, Positive = amplification")
+    print("=" * 100)
+
+
+# Example usage and demonstration
+if __name__ == "__main__":
+    print("=" * 70)
+    print("PGF Audio Processing - Standalone Benchmarking Version")
+    print("=" * 70)
+   
+    # Generate test audio
+    print("\n[1] Generating test audio...")
+    test_audio, sr = generate_test_audio(duration=5.0, sample_rate=44100)
+    print(f"    Generated {len(test_audio)} samples at {sr} Hz ({len(test_audio)/sr:.2f} seconds)")
+    print(f"    RMS level: {calculate_rms(test_audio):.4f}")
+   
+    # Single processing test
+    print("\n[2] Testing single PGF processing...")
+    processor = PGFAudioProcessor(gamma=0.1, k_value=0.1, steps=5)
+   
+    start = time.perf_counter()
+    processed = processor.process(test_audio)
+    end = time.perf_counter()
+   
+    print(f"    Processing time: {(end - start) * 1000:.2f} ms")
+    print(f"    Realtime factor: {(len(test_audio)/sr) / (end - start):.2f}x")
+    print(f"    Input RMS: {calculate_rms(test_audio):.4f}")
+    print(f"    Output RMS: {calculate_rms(processed):.4f}")
+   
+    # Comprehensive benchmark (like compression benchmark)
+    print("\n[3] Running comprehensive benchmark (all methods)...")
+    results = benchmark_all_pgf_methods(test_audio, iterations=10)
+    print_benchmark_results(results, len(test_audio) / sr)
+   
+    print("\n[4] Quality metrics comparison...")
+    # Process with different strengths
+    light = pgf_process_audio(test_audio, gamma=0.05, k_value=0.1, steps=3)
+    medium = pgf_process_audio(test_audio, gamma=0.1, k_value=0.1, steps=5)
+    heavy = pgf_process_audio(test_audio, gamma=0.2, k_value=0.1, steps=10)
+   
+    print(f"    Original:  RMS={calculate_rms(test_audio):.4f}, Peak={np.max(np.abs(test_audio)):.4f}")
+    print(f"    Light:     RMS={calculate_rms(light):.4f}, Peak={np.max(np.abs(light)):.4f}")
+    print(f"    Medium:    RMS={calculate_rms(medium):.4f}, Peak={np.max(np.abs(medium)):.4f}")
+    print(f"    Heavy:     RMS={calculate_rms(heavy):.4f}, Peak={np.max(np.abs(heavy)):.4f}")
+   
+    print("\n[5] Testing PGF Audio Suite processing modes...")
+    # Test all the preset modes
+    denoised = pgf_denoise(test_audio, strength=0.3, sensitivity=0.1, quality=5)
+    declicked = pgf_declick(test_audio, sensitivity=0.5)
+    clarity_enhanced = pgf_clarity(test_audio, amount=0.5)
+    warm = pgf_warmth(test_audio, drive=0.5, quality=8)
+   
+    print(f"    Denoise:   RMS={calculate_rms(denoised):.4f}, Peak={np.max(np.abs(denoised)):.4f}")
+    print(f"    Declick:   RMS={calculate_rms(declicked):.4f}, Peak={np.max(np.abs(declicked)):.4f}")
+    print(f"    Clarity:   RMS={calculate_rms(clarity_enhanced):.4f}, Peak={np.max(np.abs(clarity_enhanced)):.4f}")
+    print(f"    Warmth:    RMS={calculate_rms(warm):.4f}, Peak={np.max(np.abs(warm)):.4f}")
+   
+    print("\n" + "=" * 70)
+    print("Benchmark complete!")
+    print("=" * 70)
+   
+    # Optional: Save results if soundfile is available
+    try:
+        import soundfile as sf
+        print("\n[6] Saving audio examples...")
+        sf.write('pgf_test_original.wav', test_audio, sr)
+        sf.write('pgf_test_light.wav', light, sr)
+        sf.write('pgf_test_medium.wav', medium, sr)
+        sf.write('pgf_test_heavy.wav', heavy, sr)
+        sf.write('pgf_test_denoise.wav', denoised, sr)
+        sf.write('pgf_test_declick.wav', declicked, sr)
+        sf.write('pgf_test_clarity.wav', clarity_enhanced, sr)
+        sf.write('pgf_test_warmth.wav', warm, sr)
+        print("    Saved: pgf_test_*.wav files (8 variations)")
+    except ImportError:
+        print("\n[6] Install soundfile package to save audio examples")
+        print("    pip install soundfile")
+   
+    print()
